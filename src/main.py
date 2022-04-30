@@ -1,18 +1,3 @@
-"""
-Copyright 2021 Patrick Schwab, Arash Mehrjou, GlaxoSmithKline plc; Andrew Jesson, University of Oxford; Ashkan Soleymani, MIT
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
 import torch
 import scipy
 from collections import defaultdict
@@ -25,10 +10,36 @@ from slingpy.models.abstract_base_model import AbstractBaseModel
 from genedisco.active_learning_methods.acquisition_functions.base_acquisition_function import \
     BaseBatchAcquisitionFunction
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class CoreSet(object):
+    def __call__(self, dataset_x: AbstractDataSource, batch_size: int, available_indices: List[AnyStr],
+                 last_selected_indices: List[AnyStr], last_model: AbstractBaseModel) -> List:
+        topmost_hidden_representation = last_model.get_embedding(dataset_x.subset(available_indices)).numpy()
+        selected_hidden_representations = last_model.get_embedding(dataset_x.subset(last_selected_indices)).numpy()
+        chosen = self.select_most_distant(topmost_hidden_representation, selected_hidden_representations, batch_size)
+        return [available_indices[idx] for idx in chosen]
+
+    def select_most_distant(self, options, previously_selected, num_samples):
+        num_options, num_selected = len(options), len(previously_selected)
+        if num_selected == 0:
+            min_dist = np.tile(float("inf"), num_options)
+        else:
+            dist_ctr = pairwise_distances(options, previously_selected)
+            min_dist = np.amin(dist_ctr, axis=1)
+
+        indices = []
+        for i in range(num_samples):
+            idx = min_dist.argmax()
+            dist_new_ctr = pairwise_distances(options, options[[idx], :])
+            for j in range(num_options):
+                min_dist[j] = min(min_dist[j], dist_new_ctr[j, 0])
+            indices.append(idx)
+        return indices
 
 class AdversarialBIM(object):
     def __init__(self, args=None):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         if args is None:
             args = {}
 
@@ -65,7 +76,7 @@ class AdversarialBIM(object):
         data_pool = dataset_x.subset(available_indices)
 
         for i, index in enumerate(available_indices[:100]):
-            x = torch.as_tensor(data_pool.subset([index]).get_data()).to(device)
+            x = torch.as_tensor(data_pool.subset([index]).get_data()).to(self.device)
             dis[i] = self.cal_dis(x, last_model)
 
         chosen = dis.argsort()[:batch_size]
@@ -78,7 +89,7 @@ class AdversarialBIM(object):
         first_x = torch.clone(nx)
 
         nx.requires_grad_()
-        eta = torch.zeros(nx.shape).to(device)
+        eta = torch.zeros(nx.shape).to(self.device)
         iteration = 0
 
         while torch.linalg.norm(nx + eta - first_x) < self.gamma * torch.linalg.norm(first_x):
@@ -95,31 +106,6 @@ class AdversarialBIM(object):
             nx.grad.data.zero_()
             iteration += 1
         return (eta * eta).sum()
-
-def softmax_temperature(x, temperature=1):
-    """Computes softmax probabilities from unnormalized values
-
-    Args:
-
-        x: array-like list of energy values.
-        temperature: a positive real value.
-
-    Returns:
-        outputs: ndarray or list (dependin on x type) that is
-            exp(x / temperature) / sum(exp(x / temperature)).
-    """
-    if isinstance(x, list):
-        y = np.array(x)
-    else:
-        y = x
-    y = np.exp(y / temperature)
-    out_np = scipy.special.softmax(y)
-    if any(np.isnan(out_np)):
-        raise ValueError("Temperature is too extreme.")
-    if isinstance(x, list):
-        return [out_item for out_item in out_np]
-    else:
-        return out_np
 
 
 class TopUncertainAcquisition(object):
@@ -170,7 +156,7 @@ class SoftUncertainAcquisition(object):
         if len(pred_mean) < select_size:
             raise ValueError("The number of query samples exceeds"
                              "the size of the available data.")
-        selection_probabilities = softmax_temperature(
+        selection_probabilities = self.softmax_temperature(
             np.log(1e-7 + pred_uncertainties ** 2),
             temperature,
         )
@@ -183,6 +169,31 @@ class SoftUncertainAcquisition(object):
                             in numerical_selected_indices]
         return selected_indices
 
+    def softmax_temperature(self, x, temperature=1):
+        """Computes softmax probabilities from unnormalized values
+
+        Args:
+
+            x: array-like list of energy values.
+            temperature: a positive real value.
+
+        Returns:
+            outputs: ndarray or list (dependin on x type) that is
+                exp(x / temperature) / sum(exp(x / temperature)).
+        """
+        if isinstance(x, list):
+            y = np.array(x)
+        else:
+            y = x
+        y = np.exp(y / temperature)
+        out_np = scipy.special.softmax(y)
+        if any(np.isnan(out_np)):
+            raise ValueError("Temperature is too extreme.")
+        if isinstance(x, list):
+            return [out_item for out_item in out_np]
+        else:
+            return out_np
+
 
 class RandomBatchAcquisitionFunction(object):
     def __call__(self, dataset_x, batch_size, available_indices, last_selected_indices, last_model):
@@ -190,7 +201,7 @@ class RandomBatchAcquisitionFunction(object):
         return selected
 
 
-class Kmeans(object):
+class KmeansBatchAcquisitionFunction(object):
     def __init__(self, representation="linear", n_init=10):
         """
             is embedding: Apply kmeans to embedding or raw data
@@ -199,7 +210,7 @@ class Kmeans(object):
         """
         self.representation = representation
         self.n_init = n_init
-        super(Kmeans, self).__init__()
+        super(KmeansBatchAcquisitionFunction, self).__init__()
 
     def __call__(self, dataset_x: AbstractDataSource, batch_size: int, available_indices: List[AnyStr],
                  last_selected_indices: List[AnyStr], last_model: AbstractBaseModel) -> List:
@@ -223,32 +234,6 @@ class Kmeans(object):
         min_dist_indices = np.argmin(dist_ctr, axis=0)
 
         return list(min_dist_indices)
-
-
-class CoreSet(object):
-    def __call__(self, dataset_x: AbstractDataSource, batch_size: int, available_indices: List[AnyStr],
-                 last_selected_indices: List[AnyStr], last_model: AbstractBaseModel) -> List:
-        topmost_hidden_representation = last_model.get_embedding(dataset_x.subset(available_indices)).numpy()
-        selected_hidden_representations = last_model.get_embedding(dataset_x.subset(last_selected_indices)).numpy()
-        chosen = self.select_most_distant(topmost_hidden_representation, selected_hidden_representations, batch_size)
-        return [available_indices[idx] for idx in chosen]
-
-    def select_most_distant(self, options, previously_selected, num_samples):
-        num_options, num_selected = len(options), len(previously_selected)
-        if num_selected == 0:
-            min_dist = np.tile(float("inf"), num_options)
-        else:
-            dist_ctr = pairwise_distances(options, previously_selected)
-            min_dist = np.amin(dist_ctr, axis=1)
-
-        indices = []
-        for i in range(num_samples):
-            idx = min_dist.argmax()
-            dist_new_ctr = pairwise_distances(options, options[[idx], :])
-            for j in range(num_options):
-                min_dist[j] = min(min_dist[j], dist_new_ctr[j, 0])
-            indices.append(idx)
-        return indices
 
 
 class BadgeSampling(object):
@@ -339,20 +324,23 @@ class BanditRewardsLog:
 
 
 class BanditAcquisition(BaseBatchAcquisitionFunction):
-    def __init__(self):
-        ##########################
-        # Bandits to choose from:
-        # MarginSamplingAcquisition, BadgeSampling, CoreSet, Kmeans, RandomBatchAcquisitionFunction
-        # SoftUncertainAcquisition, TopUncertainAcquisition, AdversarialBIM
-        ##########################
-        self.bandits = [TopUncertainAcquisition(), RandomBatchAcquisitionFunction(), SoftUncertainAcquisition()]
+    def __init__(self, bandit_set="hitratio"):
+        """
+        :param bandit_set:"hitratio" or "mse"
+        """
+        if bandit_set == "hitratio":
+            self.bandits = [CoreSet(), AdversarialBIM(), MarginSamplingAcquisition()]
+        elif bandit_set == "mse":
+            self.bandits = [KmeansBatchAcquisitionFunction(representation="raw"), TopUncertainAcquisition(),
+                            MarginSamplingAcquisition(), RandomBatchAcquisitionFunction()]
+
         self.bandit_count = len(self.bandits)
-        self.best_bandit_ratio = 0.9 # Originally in UBC1-Tuned this would be set to 1.0, but I decided provide an epsilon
+        self.best_bandit_ratio = 0.9  # Originally in UBC1-Tuned this equals 1.0, but I've decided to provide an epsilon
 
         # initial ratios (uniform)
+        self.bandit_ratios =[]
         for bandit_id in range(self.bandit_count):
             self.bandit_ratios.append(1.0 / self.bandit_count)
-        # self.bandit_ratios = [] # alternatively you could specify custom initial ratios manually
 
         self.rewards_log = BanditRewardsLog()
         self.last_select_bandit_ids = None
@@ -363,43 +351,48 @@ class BanditAcquisition(BaseBatchAcquisitionFunction):
                  dataset_x: AbstractDataSource,
                  select_size: int,
                  available_indices: List[AnyStr], 
-                 last_selected_indices: List[AnyStr] = None, 
-                 model: AbstractBaseModel = None,
-                 temperature: float = 0.9,
+                 last_selected_indices: List[AnyStr] = None,
+                 last_model: AbstractBaseModel = None
                  ) -> List:
         if self.iteration > 0:
-            self._update_ratios(dataset_x, last_selected_indices, model)
+            self._update_ratios(dataset_x, last_selected_indices, last_model)
 
-        selected = self._select_according_to_ratios(dataset_x, select_size, available_indices,
-                                                    last_selected_indices, model)
+        selected = self._select_according_to_ratios(dataset_x, select_size, available_indices, last_selected_indices,
+                                                    last_model)
         self.iteration += 1
 
         return selected
 
+
     def print_ratios(self):
         print("=======================")
-        for bandit_id, bandit in enumerate(self.bandits):
-            print(f"Bandit {bandit_id}={str(bandit)}, ratio: {self.bandit_ratios[bandit_id]}")
+        for bandit_id in range(self.bandit_count):
+            print(f"Bandit {bandit_id}={str(self.bandits[bandit_id])}, ratio: {self.bandit_ratios[bandit_id]}")
         print("=======================")
 
-    def _update_ratios(self, dataset_x, last_selected_indices, model):
+    def _update_ratios(self, dataset_x, last_selected_indices, last_model):
         previous_x = dataset_x.subset(last_selected_indices)
-        model_pedictions = model.predict(previous_x, return_std_and_margin=True)
 
-        for s_pos, s in enumerate(last_selected_indices):
-            bandit_id = self.last_select_bandit_mapping[s]
-            reward = abs(model_pedictions[0][s_pos])
+        try:
+            model_pedictions = last_model.get_model_prediction(previous_x, False)
+            y_pred = model_pedictions[0].reshape(-1).tolist()
+        except:
+            y_pred = last_model.predict(previous_x, return_std_and_margin=False)[0]
+
+        for s_pos in range(len(last_selected_indices)):
+            bandit_id = self.last_select_bandit_mapping[last_selected_indices[s_pos]]
+            reward = abs(y_pred[s_pos])
             self.rewards_log.record_action(bandit_id, reward)
 
         best_bandit_id = self._get_current_best_bandit_id()
 
-        for bandit_id, bandit in enumerate(self.bandits):
+        for bandit_id in range(self.bandit_count):
             if bandit_id == best_bandit_id:
                 self.bandit_ratios[bandit_id] = self.best_bandit_ratio
             else:
                 self.bandit_ratios[bandit_id] = (1.0 - self.best_bandit_ratio) / (self.bandit_count - 1.0)
 
-    def _select_according_to_ratios(self, dataset_x, select_size, available_indices, last_selected_indices, model):
+    def _select_according_to_ratios(self, dataset_x, select_size, available_indices, last_selected_indices, last_model):
         bandit_id = 0
         threshold = self.bandit_ratios[bandit_id] * select_size
         selection = []
@@ -416,10 +409,10 @@ class BanditAcquisition(BaseBatchAcquisitionFunction):
 
         self.last_select_bandit_ids = np.array(self.last_select_bandit_ids)
 
-        for bandit_id, bandit in enumerate(self.bandits):
+        for bandit_id in range(self.bandit_count):
             badit_select_size = np.sum(self.last_select_bandit_ids == bandit_id)
-            bandit_selection = bandit(dataset_x, badit_select_size, bandit_available_indices, last_selected_indices,
-                                      model)
+            bandit_selection = self.bandits[bandit_id](dataset_x, badit_select_size, bandit_available_indices,
+                                                       last_selected_indices, last_model)
             selection.extend(bandit_selection)
             bandit_available_indices = [i for i in bandit_available_indices if i not in bandit_selection]
 
